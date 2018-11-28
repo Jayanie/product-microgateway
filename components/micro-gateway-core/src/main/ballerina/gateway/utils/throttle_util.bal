@@ -18,32 +18,79 @@ import ballerina/http;
 import ballerina/time;
 import ballerina/io;
 import ballerina/log;
+import ballerina/jms;
 
+map blockConditions;
 map throttleDataMap;
 public stream<RequestStreamDTO> requestStream;
 public stream<GlobalThrottleStreamDTO> globalThrottleStream;
 public boolean isStreamsInitialized;
 future ftr = start initializeThrottleSubscription();
+boolean blockConditionExist;
+boolean enabledGlobalTMEventPublishing = getConfigBooleanValue(THROTTLE_CONF_INSTANCE_ID,
+    GLOBAL_TM_EVENT_PUBLISH_ENABLED, false);
 
+public function isBlockConditionExist(string key) returns (boolean) {
+    return blockConditions.hasKey(key);
+}
+public function isAnyBlockConditionExist() returns (boolean) {
+    return blockConditionExist;
+}
+public function putBlockCondition(map m) {
+    string condition = <string>m[BLOCKING_CONDITION_KEY];
+    string conditionValue = <string>m[BLOCKING_CONDITION_VALUE];
+    string conditionState = <string>m[BLOCKING_CONDITION_STATE];
+    if (conditionState == TRUE){
+        blockConditionExist = true;
+        blockConditions[conditionValue] = conditionValue;
+    } else {
+        _ = blockConditions.remove(conditionValue);
+        if (lengthof blockConditions.keys() == 0){
+            blockConditionExist = false;
+        }
+    }
+}
+
+//check whether throttle event is in the local map(request is throttled or not)
 public function isRequestThrottled(string key) returns (boolean, boolean) {
     boolean isThrottled = throttleDataMap.hasKey(key);
     if (isThrottled) {
         int currentTime = time:currentTime().time;
-        GlobalThrottleStreamDTO dto = check <GlobalThrottleStreamDTO>throttleDataMap[key];
-        int timeStamp = dto.expiryTimeStamp;
-        boolean stopOnQuota = dto.stopOnQuota;
-        if (timeStamp >= currentTime) {
-            return (isThrottled, stopOnQuota);
-        } else {
-            boolean status = throttleDataMap.remove(key);
-            return (false, stopOnQuota);
+        if (enabledGlobalTMEventPublishing == true){
+            int timeStamp = check <int>throttleDataMap[key];
+            if (timeStamp >= currentTime) {
+                return (isThrottled, false);
+            } else {
+                boolean status = throttleDataMap.remove(key);
+                return (false, true);
+            }
+        }
+        else {
+            GlobalThrottleStreamDTO dto = check <GlobalThrottleStreamDTO>throttleDataMap[key];
+            int timeStamp = dto.expiryTimeStamp;
+            boolean stopOnQuota = dto.stopOnQuota;
+            if (timeStamp >= currentTime) {
+                return (isThrottled, stopOnQuota);
+            } else {
+                boolean status = throttleDataMap.remove(key);
+                return (false, stopOnQuota);
+            }
         }
     }
     return (isThrottled, false);
 }
 
-public function publishNonThrottleEvent(RequestStreamDTO request) {
-    requestStream.publish(request);
+public function publishNonThrottleEvent(RequestStreamDTO throttleEvent) {
+
+    //Publish throttle event to traffic manager
+    if (enabledGlobalTMEventPublishing == true){
+        publishThrottleEventToTrafficManager(throttleEvent);
+    }
+    //Publish throttle event to internal policies
+    else {
+        io:println("Publish throttle event to internal policies");
+        requestStream.publish(throttleEvent);
+    }
     printDebug(KEY_THROTTLE_UTIL, "Throttle out event is sent to the queue.");
 }
 function initializeThrottleSubscription() {
@@ -78,4 +125,12 @@ public function getEventFromThrottleData(ThrottleAnalyticsEventDTO dto) returns 
     eventDTO.correlationData = "null";
     eventDTO.payloadData = getThrottlePayloadData(dto);
     return eventDTO;
+}
+
+public function putThrottleData(string key, int expiryTimeStamp) {
+    throttleDataMap[key] = expiryTimeStamp;
+    io:println("reached the request quota");
+}
+public function removeThrottleData(string key) {
+    _ = throttleDataMap.remove(key);
 }
